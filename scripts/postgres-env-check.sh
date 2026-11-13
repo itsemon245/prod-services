@@ -22,6 +22,7 @@ source "$script_dir/shared/common.sh"
 postgres_dir="$repo_dir/postgres"
 env_file="$repo_dir/postgres/.env"
 action="${1:-validate}"
+# shellcheck disable=SC2034  # read by confirm() in shared/common.sh
 assume_yes=0
 
 if [[ $# -gt 0 ]]; then

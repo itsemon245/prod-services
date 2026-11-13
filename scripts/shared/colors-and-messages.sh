@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2034  # library: not every script uses every color
 
 # Colors
 RED='\033[0;31m'

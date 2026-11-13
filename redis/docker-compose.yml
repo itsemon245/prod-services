@@ -1,18 +1,25 @@
+# Run through `make serve redis`, which loads redis/.env and the generated
+# redis/redis_config/compose.env (project name, COMPOSE_PROFILES, mem limits).
+# Each Redis role is a Compose profile; only roles listed in REDIS_ROLES start.
+
 #Shared global config
 x-redis-common: &redis-common
-  image: ${REDIS_IMAGE:-redis:8.8.0-alpine}
+  image: ${REDIS_IMAGE:-redis:8.8.4-alpine}
   init: true
   command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
   healthcheck:
+    # Authenticates as the PING-only healthcheck user. PING answers -LOADING
+    # while a snapshot/AOF is loading, so the container is unhealthy until
+    # the data is actually available.
     test:
       [
         "CMD-SHELL",
-        "REDISCLI_AUTH=$$(awk '/^requirepass / {print $$2; exit}' /usr/local/etc/redis/redis.conf) redis-cli -h 127.0.0.1 -p 6379 ping | grep -q PONG",
+        "REDISCLI_AUTH=$$(cat /usr/local/etc/redis/healthcheck.secret) redis-cli --no-auth-warning --user healthcheck -h 127.0.0.1 -p 6379 ping | grep -q PONG",
       ]
     interval: 10s
     timeout: 3s
     retries: 6
-    start_period: 20s
+    start_period: 60s
   restart: unless-stopped
   stop_grace_period: ${REDIS_STOP_GRACE_PERIOD:-30s}
   pids_limit: ${REDIS_PIDS_LIMIT:-4096}
@@ -21,7 +28,7 @@ x-redis-common: &redis-common
     - /tmp:size=64m,noexec,nosuid,nodev
   security_opt:
     - no-new-privileges:true
-  logging:
+  logging: &redis-logging
     driver: json-file
     options:
       max-size: ${REDIS_LOG_MAX_SIZE:-100m}
@@ -31,47 +38,68 @@ x-redis-common: &redis-common
       soft: 65536
       hard: 65536
 
-#Shared service specific config
-x-redis-config-bind:
+x-redis-exporter-common: &redis-exporter-common
+  image: ${REDIS_EXPORTER_IMAGE:-oliver006/redis_exporter:v1.97.0-alpine}
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  logging: *redis-logging
+  mem_limit: 64m
+  environment:
+    REDIS_USER: exporter
+    # Low-privilege, read-only metrics user (see users.acl).
+    REDIS_PASSWORD: ${REDIS_EXPORTER_PASSWORD:-}
+
+# Config dirs are mounted as directories, not single files, so regenerated
+# files (atomic rename) are visible to ACL LOAD without a restart.
+x-redis-config-dir:
   cache: &redis-cache-config
     type: bind
-    source: ./redis_config/cache.conf
-    target: /usr/local/etc/redis/redis.conf
+    source: ${REDIS_CONFIG_DIR:-./redis_config}/cache
+    target: /usr/local/etc/redis
     read_only: true
     bind:
       create_host_path: false
   ws: &redis-ws-config
     type: bind
-    source: ./redis_config/ws.conf
-    target: /usr/local/etc/redis/redis.conf
+    source: ${REDIS_CONFIG_DIR:-./redis_config}/ws
+    target: /usr/local/etc/redis
     read_only: true
     bind:
       create_host_path: false
   session: &redis-session-config
     type: bind
-    source: ./redis_config/session.conf
-    target: /usr/local/etc/redis/redis.conf
+    source: ${REDIS_CONFIG_DIR:-./redis_config}/session
+    target: /usr/local/etc/redis
     read_only: true
     bind:
       create_host_path: false
   queue: &redis-queue-config
     type: bind
-    source: ./redis_config/queue.conf
-    target: /usr/local/etc/redis/redis.conf
+    source: ${REDIS_CONFIG_DIR:-./redis_config}/queue
+    target: /usr/local/etc/redis
     read_only: true
     bind:
       create_host_path: false
 
+networks:
+  default:
+    # A fixed name lets same-host app containers join with `external: true`.
+    name: ${REDIS_NETWORK_NAME:-redis_default}
+
 services:
   redis-cache:
     <<: *redis-common
+    profiles: [cache]
     container_name: ${REDIS_CACHE_CONTAINER_NAME:-redis-cache}
     ports:
       - "${REDIS_BIND_ADDRESS:-127.0.0.1}:${REDIS_CACHE_HOST_PORT:-6379}:6379"
     mem_limit: ${REDIS_CACHE_MEM_LIMIT:?Run make config redis}
     volumes:
       - type: bind
-        source: ${REDIS_CACHE_DATA_DIR:-./data/cache}
+        source: ${REDIS_CACHE_DATA_DIR:-/srv/prod-services/redis/cache}
         target: /data
         bind:
           create_host_path: false
@@ -79,13 +107,14 @@ services:
 
   redis-ws:
     <<: *redis-common
+    profiles: [ws]
     container_name: ${REDIS_WS_CONTAINER_NAME:-redis-ws}
     ports:
       - "${REDIS_BIND_ADDRESS:-127.0.0.1}:${REDIS_WS_HOST_PORT:-6382}:6379"
     mem_limit: ${REDIS_WS_MEM_LIMIT:?Run make config redis}
     volumes:
       - type: bind
-        source: ${REDIS_WS_DATA_DIR:-./data/ws}
+        source: ${REDIS_WS_DATA_DIR:-/srv/prod-services/redis/ws}
         target: /data
         bind:
           create_host_path: false
@@ -93,13 +122,14 @@ services:
 
   redis-session:
     <<: *redis-common
+    profiles: [session]
     container_name: ${REDIS_SESSION_CONTAINER_NAME:-redis-session}
     ports:
       - "${REDIS_BIND_ADDRESS:-127.0.0.1}:${REDIS_SESSION_HOST_PORT:-6380}:6379"
     mem_limit: ${REDIS_SESSION_MEM_LIMIT:?Run make config redis}
     volumes:
       - type: bind
-        source: ${REDIS_SESSION_DATA_DIR:-./data/session}
+        source: ${REDIS_SESSION_DATA_DIR:-/srv/prod-services/redis/session}
         target: /data
         bind:
           create_host_path: false
@@ -107,14 +137,86 @@ services:
 
   redis-queue:
     <<: *redis-common
+    profiles: [queue]
     container_name: ${REDIS_QUEUE_CONTAINER_NAME:-redis-queue}
     ports:
       - "${REDIS_BIND_ADDRESS:-127.0.0.1}:${REDIS_QUEUE_HOST_PORT:-6381}:6379"
     mem_limit: ${REDIS_QUEUE_MEM_LIMIT:?Run make config redis}
     volumes:
       - type: bind
-        source: ${REDIS_QUEUE_DATA_DIR:-./data/queue}
+        source: ${REDIS_QUEUE_DATA_DIR:-/srv/prod-services/redis/queue}
         target: /data
         bind:
           create_host_path: false
       - *redis-queue-config
+
+  # Opt-in TCP gateway (REDIS_GATEWAY=on) for clients on other hosts.
+  # Docker-published ports bypass UFW; the allowlist in HAProxy is what
+  # restricts access. Keep a host/cloud firewall in front as well.
+  redis-gateway:
+    profiles: [gateway]
+    image: ${REDIS_GATEWAY_IMAGE:-haproxy:3.2.26-alpine}
+    container_name: ${REDIS_GATEWAY_CONTAINER_NAME:-redis-gateway}
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid,nodev
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    logging: *redis-logging
+    mem_limit: ${REDIS_GATEWAY_MEM_LIMIT:-256m}
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    # Per-role listener ports are added by the generated
+    # redis_config/compose.override.yml, only for enabled roles.
+    ports:
+      - "127.0.0.1:${REDIS_GATEWAY_METRICS_PORT:-8405}:8405"
+    volumes:
+      - type: bind
+        source: ${REDIS_CONFIG_DIR:-./redis_config}/gateway
+        target: /usr/local/etc/haproxy
+        read_only: true
+        bind:
+          create_host_path: false
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8405/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # Opt-in Prometheus exporters (REDIS_EXPORTER=on), one per enabled role,
+  # published on REDIS_EXPORTER_BIND_ADDRESS (loopback by default).
+  redis-exporter-cache:
+    <<: *redis-exporter-common
+    profiles: [cache-exporter]
+    container_name: ${REDIS_CACHE_CONTAINER_NAME:-redis-cache}-exporter
+    command: ["--redis.addr=redis://redis-cache:6379"]
+    ports:
+      - "${REDIS_EXPORTER_BIND_ADDRESS:-127.0.0.1}:${REDIS_CACHE_EXPORTER_PORT:-9121}:9121"
+
+  redis-exporter-session:
+    <<: *redis-exporter-common
+    profiles: [session-exporter]
+    container_name: ${REDIS_SESSION_CONTAINER_NAME:-redis-session}-exporter
+    command: ["--redis.addr=redis://redis-session:6379"]
+    ports:
+      - "${REDIS_EXPORTER_BIND_ADDRESS:-127.0.0.1}:${REDIS_SESSION_EXPORTER_PORT:-9122}:9121"
+
+  redis-exporter-queue:
+    <<: *redis-exporter-common
+    profiles: [queue-exporter]
+    container_name: ${REDIS_QUEUE_CONTAINER_NAME:-redis-queue}-exporter
+    command: ["--redis.addr=redis://redis-queue:6379"]
+    ports:
+      - "${REDIS_EXPORTER_BIND_ADDRESS:-127.0.0.1}:${REDIS_QUEUE_EXPORTER_PORT:-9123}:9121"
+
+  redis-exporter-ws:
+    <<: *redis-exporter-common
+    profiles: [ws-exporter]
+    container_name: ${REDIS_WS_CONTAINER_NAME:-redis-ws}-exporter
+    command: ["--redis.addr=redis://redis-ws:6379"]
+    ports:
+      - "${REDIS_EXPORTER_BIND_ADDRESS:-127.0.0.1}:${REDIS_WS_EXPORTER_PORT:-9124}:9121"
