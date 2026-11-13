@@ -41,8 +41,13 @@ make config db
 make serve db
 make config redis
 make serve redis
+make status redis
+make backup redis
+make reload-redis-acl
+make reload-redis-gateway
 make ensure-db-env
 make ensure-redis-env
+make lint
 ```
 
 `db` and `postgres` are aliases, so `make config postgres` also works.
@@ -63,11 +68,16 @@ postgres/pg_config/
 redis/redis_config/
 ```
 
-Generated config files are ignored by git. Redis generated configs include
-`requirepass` values from `redis/.env`, so treat `redis/redis_config/` as
-sensitive local output.
+Generated config files are ignored by git. Redis configs hold no plaintext
+passwords: `users.acl` has SHA-256 hashes, and `healthcheck.secret` (0600) holds
+only the password of the PING-only healthcheck user. Treat
+`redis/redis_config/` as sensitive local output anyway.
+
+Data, backups and migration runs live outside the checkout by default, under
+`/srv/prod-services/`.
 
 ## Service Docs
 
 - [Postgres production service](postgres/README.md)
-- [Redis production service](redis/README.md)
+- [Redis production service](redis/README.md): roles, ACL, gateway, backups, migration
+- [Onboarding Artistly onto Redis](redis/docs/artistly-onboarding.md)

@@ -10,14 +10,15 @@ SERVICE := $(if $(SERVICE_ARG),$(SERVICE_ARG),db)
 CANONICAL_SERVICE := $(if $(filter postgres,$(SERVICE)),db,$(SERVICE))
 INSTALL_ARG := $(firstword $(filter $(KNOWN_INSTALLERS),$(MAKECMDGOALS)))
 INSTALLER := $(if $(INSTALL_ARG),$(INSTALL_ARG),docker)
-KNOWN_GOALS := help install docker install-docker config serve db postgres redis config-db serve-db ensure-db-env validate-db-env preview-db-env ensure-db-config prepare-db-data-dir config-redis serve-redis ensure-redis-env validate-redis-env preview-redis-env ensure-redis-config prepare-redis-data-dirs
+REDIS_OPS_GOALS := backup status backup-redis status-redis reload-redis-acl reload-redis-gateway compose-redis lint
+KNOWN_GOALS := help install docker install-docker config serve db postgres redis config-db serve-db ensure-db-env validate-db-env preview-db-env ensure-db-config prepare-db-data-dir config-redis serve-redis ensure-redis-env validate-redis-env preview-redis-env ensure-redis-config prepare-redis-data-dirs $(REDIS_OPS_GOALS)
 UNKNOWN_GOALS := $(filter-out $(KNOWN_GOALS),$(MAKECMDGOALS))
 
 ifneq ($(UNKNOWN_GOALS),)
 $(error Unknown make goal(s): $(UNKNOWN_GOALS))
 endif
 
-.PHONY: help install docker install-docker config serve db postgres redis config-db serve-db ensure-db-env validate-db-env preview-db-env ensure-db-config prepare-db-data-dir config-redis serve-redis ensure-redis-env validate-redis-env preview-redis-env ensure-redis-config prepare-redis-data-dirs
+.PHONY: help install docker install-docker config serve db postgres redis config-db serve-db ensure-db-env validate-db-env preview-db-env ensure-db-config prepare-db-data-dir config-redis serve-redis ensure-redis-env validate-redis-env preview-redis-env ensure-redis-config prepare-redis-data-dirs $(REDIS_OPS_GOALS)
 
 help:
 	@printf 'Usage:\n'
@@ -26,6 +27,12 @@ help:
 	@printf '  make serve db      Validate env, preview safe values, ensure config/data dir, start Postgres\n'
 	@printf '  make config redis  Generate Redis configs from host resources\n'
 	@printf '  make serve redis   Validate env, preview safe values, ensure config/data dirs, start Redis\n'
+	@printf '  make status redis  Memory, eviction, persistence and auth-failure counters per role\n'
+	@printf '  make backup redis  BGSAVE, copy RDB/AOF with checksums to REDIS_BACKUP_DIR, prune\n'
+	@printf '  make reload-redis-acl      Regenerate ACL files and ACL LOAD (password rotation)\n'
+	@printf '  make reload-redis-gateway  Regenerate, check and hitlessly reload the HAProxy gateway\n'
+	@printf '  make compose-redis ARGS="ps"  Run docker compose with the generated Redis env\n'
+	@printf '  make lint          shellcheck and docker compose config on throwaway env files\n'
 	@printf '  make ensure-db-env     Create/fill postgres/.env passwords when needed\n'
 	@printf '  make ensure-redis-env  Create/fill redis/.env passwords when needed\n'
 	@printf '\n'
@@ -40,6 +47,12 @@ config:
 
 serve:
 	@$(MAKE) --no-print-directory serve-$(CANONICAL_SERVICE)
+
+backup:
+	@$(MAKE) --no-print-directory backup-$(CANONICAL_SERVICE)
+
+status:
+	@$(MAKE) --no-print-directory status-$(CANONICAL_SERVICE)
 
 docker db postgres redis:
 	@:
@@ -94,15 +107,9 @@ preview-redis-env:
 	@scripts/redis-env-check.sh preview
 
 ensure-redis-config:
-	@if [[ ! -s redis/redis_config/cache.conf || ! -s redis/redis_config/ws.conf || ! -s redis/redis_config/session.conf || ! -s redis/redis_config/queue.conf || ! -s redis/redis_config/compose.env ]]; then \
-		printf 'Redis config is missing; running make config redis\n'; \
-		$(MAKE) --no-print-directory config redis; \
-	elif [[ scripts/generate-redis-config.sh -nt redis/redis_config/cache.conf || redis/templates/redis.conf.tpl -nt redis/redis_config/cache.conf || ( -f redis/.env && redis/.env -nt redis/redis_config/cache.conf ) || ( -f redis/.env && redis/.env -nt redis/redis_config/compose.env ) ]]; then \
-		printf 'Redis config inputs changed; running make config redis\n'; \
-		$(MAKE) --no-print-directory config redis; \
-	else \
-		printf 'Redis config exists: redis/redis_config\n'; \
-	fi
+	@# Always regenerate: it is cheap and idempotent, and inputs now include
+	@# REDIS_ROLES, the gateway allowlist and shared scripts.
+	@$(MAKE) --no-print-directory config redis
 
 prepare-redis-data-dirs:
 	@scripts/redis-env-check.sh prepare-data-dirs
@@ -113,4 +120,27 @@ serve-redis:
 	@scripts/redis-env-check.sh preview
 	@$(MAKE) --no-print-directory ensure-redis-config
 	@$(MAKE) --no-print-directory prepare-redis-data-dirs
-	@docker compose --env-file redis/.env --env-file redis/redis_config/compose.env -f redis/docker-compose.yml up -d
+	@scripts/redis-ops.sh compose -- up -d --wait
+	@# Containers that were not recreated still hold the ACL they started with;
+	@# load the regenerated users.acl and check every password authenticates.
+	@scripts/redis-ops.sh acl-reload
+
+compose-redis:
+	@scripts/redis-ops.sh compose -- $(ARGS)
+
+status-redis:
+	@scripts/redis-ops.sh status
+
+backup-redis:
+	@scripts/redis-backup.sh
+
+reload-redis-acl:
+	@$(MAKE) --no-print-directory config redis
+	@scripts/redis-ops.sh acl-reload
+
+reload-redis-gateway:
+	@$(MAKE) --no-print-directory config redis
+	@scripts/redis-ops.sh gateway-reload
+
+lint:
+	@scripts/lint.sh
